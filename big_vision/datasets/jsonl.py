@@ -18,17 +18,24 @@ import hashlib
 import json
 from multiprocessing.pool import ThreadPool
 import os
+import math
 import tempfile
 import urllib.request
 
 from absl import logging
 import big_vision.datasets.core as ds_core
+from big_vision.pp import utils
+import imageio.v3 as iio
 import jax
 import numpy as np
 import overrides
 import tensorflow as tf
+import tensorflow_io as tfio
+from tqdm import tqdm
+# import random
+# random.seed(42)
 
-
+DEFAULT_NUM_PARALLEL_CALLS = 100
 def cached_download(url, dest=None, verbose=True):
   """Download `url` to local file and return path to that, but with caching."""
   # NOTE: there is a small chance of saving corrupted data if the process is
@@ -59,7 +66,8 @@ class DataSource(ds_core.DataSource):
   """.jsonl DataSource."""
 
   def __init__(self, fname, *, fopen_keys=(), download_keys=(),
-               start=0, stop=float("inf")):
+               start=0, stop=None,
+               split=None, video_num_frames=None, video_frame_size=None, max_segments=None):
     """Create data-source that's jsonl + data files (eg images).
 
     This correctly supports multi-host in that each host only reads a subset of
@@ -81,6 +89,7 @@ class DataSource(ds_core.DataSource):
         Must be a subset of `fopen_keys`.
       start: int, index of the first row to use; use for slicing the data.
       stop: int or inf, index of the row after the last one to use.
+      video_num_frames: int, number of video frames to extract, if this is a video dataset
 
     Note:
       This simple data input does not allow for nested/hierarchical values,
@@ -89,6 +98,9 @@ class DataSource(ds_core.DataSource):
       The way start/stop arguments are used is as in list slicing[start:stop].
     """
     self.examples = []
+    self.video_num_frames = video_num_frames
+    self.video_fps = 30
+    self.video_frame_size = video_frame_size
 
     with tf.io.gfile.GFile(fname) as f:
       for i, line in enumerate(f):
@@ -97,6 +109,50 @@ class DataSource(ds_core.DataSource):
             self.examples.append(json.loads(line))
           except json.decoder.JSONDecodeError as e:
             raise ValueError(f"Invalid JSON in line {i}:\n{line}") from e
+
+    for datum in self.examples:
+        # datum['question'] = 'How many people are there? Write only the number and no other text.'
+        if 'images' in datum:
+            assert 'image_root' in datum
+            for i, im in enumerate(datum['images']):
+                if isinstance(im, int):
+                    datum[f'image_{i}'] = os.path.join(datum['image_root'], 'frame_{:04d}.jpg'.format(im))
+                else:
+                    datum[f'image_{i}'] = im
+            del datum['image_root']
+            del datum['images']
+        if max_segments is not None:
+            # datum['num_segments'] = len([k for k in datum if 'answer' in k])
+            datum['segment_flags'] = [1 for _ in range(len([k for k in datum if 'answer' in k]))]+[0 for _ in range(max_segments-len([k for k in datum if 'answer' in k]))]
+            if max_segments > 1:
+              for i in range(max_segments):
+                  if f'answer{i}' not in datum:
+                      assert f'question{i}' not in datum
+                      datum[f'question{i}'] = ""
+                      datum[f'answer{i}'] = ""
+        if "question" in datum:
+          datum["question_str"] = datum["question"]
+    print('len examples', len(self.examples))
+    if self.video_num_frames is not None:
+        for i in tqdm(range(len(self.examples))):
+            if 'image' in self.examples[i]:
+                assert all(['image_' not in key for key in self.examples[i]])
+                self.examples[i]['image_0'] = self.examples[i]['image']
+                del self.examples[i]['image']
+            max_frame_idx = max([int(key.split('image_')[1]) for key in self.examples[i] if 'image_' in key])
+            if max_frame_idx >= self.video_num_frames:
+                new_images = {}
+                for j in range(self.video_num_frames):
+                    new_images[f'image_{j}'] = self.examples[i][f'image_{int(j*max_frame_idx/self.video_num_frames)}']
+                for j in range(self.video_num_frames, max_frame_idx+1):
+                    del self.examples[i][f'image_{j}']
+                for key in new_images:
+                    self.examples[i][key] = new_images[key]
+                max_frame_idx = self.video_num_frames-1
+            for j in range(max_frame_idx+1, self.video_num_frames):
+                self.examples[i][f'image_{j}'] = self.examples[i]['image_0']
+            self.examples[i]['mask_image'] = max_frame_idx+1
+    # random.shuffle(self.examples)
 
     if download_keys:
       for k in download_keys:
@@ -124,26 +180,30 @@ class DataSource(ds_core.DataSource):
 
     # We need to apply fopen path prefix here already, because doing so while
     # actually reading the files in TF, things are symbolic :(
-    for ex in self.examples:
-      for k, dirname in self.fopen_keys.items():
-        ex[k] = os.path.join(dirname, ex[k])
+    if any([len(dirname) > 0 for dirname in self.fopen_keys.values()]):
+      for ex in tqdm(self.examples):
+        for k, dirname in self.fopen_keys.items():
+          if len(dirname) > 0:
+            ex[k] = os.path.join(dirname, ex[k])
 
-  def _indices(self, *, process_split=True, process_index=None):
+  def _indices(self, *, process_split=True, process_index=None, split_by_modulus=False):
     indices = np.arange(len(self.examples))
 
     if not process_split:
       return list(indices)
 
     pid = jax.process_index() if process_index is None else process_index
+    if split_by_modulus:
+      return indices[pid::jax.process_count()]
     return list(np.array_split(indices, jax.process_count())[pid])
 
   @overrides.overrides
-  def get_tfdata(self, ordered=False, *, process_split=True, allow_cache=True):
+  def get_tfdata(self, ordered=False, *, process_split=True, allow_cache=True, split_by_modulus=False):
     del allow_cache  # We don't cache anything anyways.
     assert not process_split or len(self.examples) >= jax.process_count(), (
-        "Process splitting the data with fewer examples than processes!?")
+        f"Process splitting the data with fewer examples than processes ({str(len(self.examples))}, {str(jax.process_count())})!?")
 
-    my_idxs = self._indices(process_split=process_split)
+    my_idxs = self._indices(process_split=process_split, split_by_modulus=split_by_modulus)
     if not ordered:
       np.random.shuffle(my_idxs)
 
@@ -159,6 +219,7 @@ class DataSource(ds_core.DataSource):
         example[k] = tf.io.read_file(example[k])
       return example
     dataset = dataset.map(_read_files)
+    # dataset = dataset.map(_read_files, num_parallel_calls=DEFAULT_NUM_PARALLEL_CALLS)
 
     return dataset
 

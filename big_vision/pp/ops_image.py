@@ -21,16 +21,18 @@ dictionary.
 The key named "image" is commonly used for the image, and is a 3D tensor of
 shape (height x width x channels).
 """
+from typing import List
 
 from big_vision.pp import utils
 from big_vision.pp.registry import Registry
 
+from PIL import Image
 import tensorflow as tf
 
 
 @Registry.register("preprocess_ops.decode")
 @utils.InKeyOutKey()
-def get_decode(channels=3, precise=False):
+def get_decode(channels=3, precise=False, raw=False, max_bytes=None):
   """Decode an encoded image string, see tf.io.decode_image.
 
   Args:
@@ -44,7 +46,21 @@ def get_decode(channels=3, precise=False):
   """
 
   def _decode(image):
-    if precise:
+    if raw:
+      im = tf.io.decode_raw(image, out_type=tf.uint8)
+      # im = image
+      # tf.print(str(im))
+      # tf.print(str(im.shape))
+      if max_bytes is not None:
+        im = tf.cond(
+            tf.shape(im)[0] >= max_bytes,
+            lambda: im[:max_bytes],
+            lambda: tf.pad(
+                im, [(0, max_bytes - tf.shape(im)[0])],
+                constant_values=256),
+        )
+      return im
+    elif precise:
       return tf.image.decode_jpeg(  # Also supports png btw.
           image, channels=channels, dct_method="INTEGER_ACCURATE")
     else:
@@ -81,11 +97,303 @@ def get_resize(size, method="bilinear", antialias=False):
     # applied after resize.
     dtype = image.dtype
     tf_dtype = tf.type_spec_from_value(image).dtype
+    # tf.print(image)
     image = tf.image.resize(image, size, method=method, antialias=antialias)
     return tf.cast(tf.clip_by_value(image, tf_dtype.min, tf_dtype.max), dtype)
 
   return _resize
 
+@Registry.register("preprocess_ops.resize_llava_square")
+@utils.InKeyOutKey()
+def get_resize_llava_square(size, method="bicubic", antialias=False):
+  size = utils.maybe_repeat(size, 2)
+  # def _resize_numpy(image):
+  #   pil_image = Image.fromarray(image)
+  #   pil_resized = pil_image.resize(size, resample=getattr(Image.Resampling, method.upper()))
+  #   np_resized = np.array(pil_resized)
+  #   return np_resized
+  def _resize_square(image):
+    image_shape = tf.shape(image)
+    original_width = image_shape[1]
+    original_height = image_shape[0]
+    dtype = image.dtype
+    tf_dtype = tf.type_spec_from_value(image).dtype
+    num_channels = image_shape[2]
+    new_width = tf.cond(original_width > original_height, lambda: original_width, lambda: original_height)
+    new_height = new_width
+    color = 127
+    top_padding = color*tf.ones(((new_height - original_height) // 2, original_width, num_channels), dtype=dtype)
+    bottom_padding = color*tf.ones(((new_height - original_height) // 2 + (new_height - original_height) % 2, original_width, num_channels), dtype=dtype)
+    left_padding = color*tf.ones((new_height, (new_width - original_width) // 2, num_channels), dtype=dtype)
+    right_padding = color*tf.ones((new_height, (new_width - original_width) // 2 + (new_width - original_width) % 2, num_channels), dtype=dtype)
+    height_padded_image = tf.concat([
+      top_padding,
+      image,
+      bottom_padding
+    ], axis=0)
+    width_padded_image = tf.concat([
+      left_padding,
+      height_padded_image,
+      right_padding
+    ], axis=1)
+    # tf.print('pre resize', width_padded_image[419:430,:,:])
+    resized_image = tf.image.resize(width_padded_image, size, method=method, antialias=antialias)
+    # resized_image = tf.numpy_function(_resize_numpy, [width_padded_image], tf_dtype)
+    # tf.print('post resize', resized_image[100:110,:,:])
+    return tf.cast(tf.math.round(tf.clip_by_value(resized_image, tf_dtype.min, tf_dtype.max)), dtype)
+  return _resize_square
+
+@Registry.register("preprocess_ops.resize_anyres")
+@utils.InKeyOutKey()
+def get_resize_anyres(size, method="bilinear", antialias=False):
+  possible_resolutions = tf.convert_to_tensor([
+    [
+      384,
+      384
+    ],
+    [
+      384,
+      768
+    ],
+    [
+      384,
+      1152
+    ],
+    [
+      384,
+      1536
+    ],
+    [
+      384,
+      1920
+    ],
+    [
+      384,
+      2304
+    ],
+    [
+      768,
+      384
+    ],
+    [
+      768,
+      768
+    ],
+    [
+      768,
+      1152
+    ],
+    [
+      768,
+      1536
+    ],
+    [
+      768,
+      1920
+    ],
+    [
+      768,
+      2304
+    ],
+    [
+      1152,
+      384
+    ],
+    [
+      1152,
+      768
+    ],
+    [
+      1152,
+      1152
+    ],
+    [
+      1152,
+      1536
+    ],
+    [
+      1152,
+      1920
+    ],
+    [
+      1152,
+      2304
+    ],
+    [
+      1536,
+      384
+    ],
+    [
+      1536,
+      768
+    ],
+    [
+      1536,
+      1152
+    ],
+    [
+      1536,
+      1536
+    ],
+    [
+      1536,
+      1920
+    ],
+    [
+      1536,
+      2304
+    ],
+    [
+      1920,
+      384
+    ],
+    [
+      1920,
+      768
+    ],
+    [
+      1920,
+      1152
+    ],
+    [
+      1920,
+      1536
+    ],
+    [
+      1920,
+      1920
+    ],
+    [
+      1920,
+      2304
+    ],
+    [
+      2304,
+      384
+    ],
+    [
+      2304,
+      768
+    ],
+    [
+      2304,
+      1152
+    ],
+    [
+      2304,
+      1536
+    ],
+    [
+      2304,
+      1920
+    ],
+    [
+      2304,
+      2304
+    ]
+  ], dtype=tf.int32)
+  def _resize_anyres(image):
+    original_width = image.shape[1]
+    original_height = image.shape[0]
+    num_channels = image.shape[2]
+    dtype = image.dtype
+    tf_dtype = tf.type_spec_from_value(image).dtype
+    scale = tf.math.minimum(possible_resolutions[:,0] / original_height, possible_resolutions[:,1] / original_width)
+    downscaled_height = tf.cast(tf.math.floor(original_height * scale), dtype=tf.int32)
+    downscaled_width = tf.cast(tf.math.floor(original_width * scale), dtype=tf.int32)
+    effective_resolution = tf.math.minimum(downscaled_width * downscaled_height, original_width * original_height * tf.ones_like(downscaled_width))
+    wasted_resolution = (possible_resolutions[:,0] * possible_resolutions[:,1]) - effective_resolution
+    max_effective_resolution = tf.math.reduce_max(effective_resolution, axis=0)
+    min_wasted_resolution = tf.reduce_min(
+      tf.where(
+        effective_resolution == max_effective_resolution,
+        wasted_resolution,
+        tf.reduce_max(wasted_resolution, axis=0)*tf.ones_like(wasted_resolution)
+      ),
+      axis=0
+    )
+    best_fit_index = tf.math.argmin(min_wasted_resolution, axis=0)
+    target_height = possible_resolutions[best_fit_index, 0]
+    target_width = possible_resolutions[best_fit_index, 1] 
+    scale_w = target_width / original_width
+    scale_h = target_height / original_height
+    new_width = tf.cond(scale_w < scale_h, target_width, tf.math.minimum(tf.math.ceil(original_width * scale_h), target_width))
+    new_height = tf.cond(scale_w < scale_h, tf.math.minimum(tf.math.ceil(original_height * scale_w), target_height), target_height)
+    resized_image = tf.image.resize(image, (new_height, new_width), method=method, antialias=antialias)
+    paste_x = (target_width - new_width) // 2
+    paste_y = (target_height - new_height) // 2
+    height_padded_image = tf.concat([
+      tf.zeros((paste_y, new_width, num_channels), dtype=dtype),
+      resized_image,
+      tf.zeros((paste_y, new_width, num_channels), dtype=dtype),
+    ], axis=0)
+    width_padded_image = tf.concat([
+      tf.zeros((target_height, paste_x, num_channels), dtype=dtype),
+      resized_image,
+      tf.zeros((target_height, paste_x, num_channels), dtype=dtype),
+    ], axis=1)
+    new_image = width_padded_image
+    new_image = tf.cast(tf.clip_by_value(new_image, tf_dtype.min, tf_dtype.max), dtype) # [H, W, C]
+    new_image = tf.reshape(new_image, [new_image.shape[0]*new_image.shape[1] / size.shape[1], size.shape[1], new_image.shape[2]])
+    new_image = tf.reshape(new_image, [new_image.shape[0]*new_image.shape[1] / (size.shape[0] * size.shape[1]), size.shape[0], size.shape[1], new_image.shape[2]])
+    return new_image
+  return _resize_anyres
+
+@Registry.register("preprocess_ops.qwen_smart_resize")
+@utils.InKeyOutKey()
+def get_qwen_smart_resize(factor: int = 28, min_pixels: int = 4*28*28, max_pixels: int = 16384*28*28, scale_factor: float = 1. / 255, image_mean: List[float] = [0.48145466, 0.4578275, 0.40821073], image_std: List[float] = [0.26862954, 0.26130258, 0.27577711]):
+  def _qwen_smart_resize(image):
+    original_width = image.shape[1]
+    original_height = image.shape[0]
+    num_channels = image.shape[2]
+    h_bar = tf.math.maximum(factor, tf.math.round(original_height / factor) * factor)
+    w_bar = tf.math.maximum(factor, tf.math.round(original_width / factor) * factor)
+    beta = tf.cond(
+      h_bar * w_bar > max_pixels,
+      tf.math.sqrt((original_height * original_width) / max_pixels),
+      tf.cond(
+        h_bar * w_bar < min_pixels,
+        tf.math.sqrt(min_pixels / (height * width)),
+        1
+      )
+    )
+    h_bar = tf.cond(
+      h_bar * w_bar > max_pixels,
+      tf.math.floor((original_height / beta) / factor) * factor,
+      tf.cond(
+        h_bar * w_bar < min_pixels,
+        tf.math.ceil((original_height * beta) / factor) * factor,
+        h_bar
+      )
+    )
+    w_bar = tf.cond(
+      h_bar * w_bar > max_pixels,
+      tf.math.floor((original_width / beta) / factor) * factor,
+      tf.cond(
+        h_bar * w_bar < min_pixels,
+        tf.math.ceil((original_width * beta) / factor) * factor,
+        w_bar
+      )
+    )
+    new_image = tf.image.resize(image, (h_bar, w_bar), method='bicubic', antialias=True)
+    new_image = new_image * scale_factor
+    for i in range(3):
+      new_image[...,i] = (new_image[...,i] - image_mean[i]) / image_std[i]
+
+    return new_image
+  return _qwen_smart_resize
+
+"""@Registry.register("preprocess_ops.resize_video")
+@utils.InKeyOutKey()
+def get_resize_video(size, method="bilinear", antialias=False):
+    size = utils.maybe_repeat(size, 2)
+    def _resize(video):
+      dtype = video.dtype
+      tf_dtype = tf.type_spec_from_value(video).dtype
+      resized_frames = []
+      for frame in tf.unstack(video, axis=0):
+        resized_frame = tf.image.resize(frame, size, method=method, antialias=antialias)
+        resized_frames.append(resized_frame)"""
 
 # This functionality is used by resize_small and resize_long. But we're not
 # registering it as a pp op yet, as there is no need for it. However, it can
@@ -339,6 +647,17 @@ def get_clip_value_range():
     return (tf.cast(image, tf.float32) - mean) / std
   return _clip_value_range
 
+@Registry.register("preprocess_ops.llava_value_range")
+@utils.InKeyOutKey()
+def get_llava_value_range(
+  mean=0.5,
+  std=0.5
+):
+  def _llava_value_range(image):
+    # tf.print('in image', image)
+    # tf.print('scaled centered image', tf.cast(image, tf.float32) / 255.0 - mean)
+    return (tf.cast(image, tf.float32) / 255.0 - mean) / std
+  return _llava_value_range
 
 @Registry.register("preprocess_ops.convert_to_video")
 @utils.InKeyOutKey()

@@ -1,3 +1,4 @@
+# Copyright 2025 big_video_lm authors - Changes for flash attention and LLaVA support
 # Copyright 2024 Big Vision Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,18 +19,31 @@ However, the names of modules are made to match the old ones for easy loading.
 """
 
 from typing import Optional, Sequence, Union
+import functools
+import inspect
+import math
 
 from absl import logging
 from big_vision import utils
 from big_vision.models import common
 import flax
 import flax.linen as nn
+from flax.linen.attention import combine_masks
+from flax.linen.module import compact
 import flax.training.checkpoints
 import jax
+from jax import lax
 import jax.numpy as jnp
+from jax._src.core import ShapedArray
+from big_vision.flash_attention import flash_attention, BlockSizes
+from jax.experimental.shard_map import shard_map
 import numpy as np
 import scipy.ndimage
+from einops import rearrange
+from easydel.etils.errors import EasyDeLBlockWiseFFNError
 
+from jax_array_info import sharding_info
+from scalax.sharding import with_sharding_annotation
 
 def posemb_sincos_2d(h, w, width, temperature=10_000., dtype=jnp.float32):
   """Follows the MoCo v3 logic."""
@@ -43,6 +57,14 @@ def posemb_sincos_2d(h, w, width, temperature=10_000., dtype=jnp.float32):
   pe = jnp.concatenate([jnp.sin(x), jnp.cos(x), jnp.sin(y), jnp.cos(y)], axis=1)
   return jnp.asarray(pe, dtype)[None, :, :]
 
+def posemb_sincos_1d(seqlen, width, temperature=10_000., dtype=jnp.float32):
+  y = jnp.mgrid[:seqlen]
+  assert width % 2 == 0
+  omega = jnp.arange(width // 2) / (width // 2 - 1)
+  omega = 1. / (temperature**omega)
+  y = jnp.einsum("m,d->md", y.flatten(), omega)
+  pe = jnp.concatenate([jnp.sin(y), jnp.cos(y)], axis=1)
+  return jnp.asarray(pe, dtype)[None, :, :]
 
 def get_posemb(self, typ, seqshape, width, name, dtype=jnp.float32):
   if typ == "learn":
@@ -50,15 +72,72 @@ def get_posemb(self, typ, seqshape, width, name, dtype=jnp.float32):
                       (1, np.prod(seqshape), width), dtype)
   elif typ == "sincos2d":
     return posemb_sincos_2d(*seqshape, width, dtype=dtype)
+  elif typ == "sincos1d":
+    return posemb_sincos_1d(seqshape, width, dtype=dtype)
   else:
     raise ValueError(f"Unknown posemb type: {typ}")
 
+def flash_attention_output(query, key, value, attention_bias):
+  return flash_attention(query, key, value, attention_bias)[0]
+
+def block_wise_ffn(remat_ffn, inputs, chunk_size: int, deterministic: bool, axis: int = 1):
+  generating = inputs.shape[1] == 1
+  try:
+    if generating:
+      return remat_ffn(inputs, deterministic)
+    else:
+      scan_axis = None
+      if axis == 1:
+        inputs = rearrange(inputs, "b (c n) d -> b c n d", c=chunk_size)
+        scan_axis = 2
+      else:
+        assert axis == 0
+        inputs = rearrange(inputs, "(b c) n d -> b c n d", c=chunk_size)
+        scan_axis = 0
+
+      def scan_ffn(remat_ffn_, carry, hidden_states):
+        outputs = remat_ffn_(hidden_states, deterministic)
+        return carry, outputs
+
+      _, output = nn.scan(
+        scan_ffn,
+        variable_broadcast="params",
+        split_rngs={"params": False, "dropout": True},
+        in_axes=scan_axis,
+        out_axes=scan_axis,
+      )(remat_ffn, None, inputs)
+      if axis == 1:
+        output = rearrange(output, "b c n d -> b (c n) d")
+      else:
+        output = rearrange(output, "b c n d -> (b c) n d")
+      return output
+  except Exception as e:
+      raise EasyDeLBlockWiseFFNError(
+          "You Are using BlockWise FFN from near-infinite-context length paper and you might be passing "
+          "input arguments in wrong way in case that you don't want to use this just pass `use_scan_mlp=False` in "
+          "model config or in config_kwargs in AutoEasyDeLModelForCausalLM or change `scan_mlp_chunk_size` "
+          f"in configs for more information read Docs.\nOriginal Error\n{e}"
+      )
+
+class LlavaMlp(nn.Module):
+  mlp_dim: int
+  dtype_mm: str = "float32"
+  # precision: Optional[jax.lax.Precision] = None
+  inits: dict = None
+
+  @nn.compact
+  def __call__(self, x, deterministic=True):
+    x1 = x = nn.Dense(self.mlp_dim, dtype=self.dtype_mm, name="head1", **self.inits)(x)
+    x = nn.gelu(x, approximate=False)
+    x = nn.Dense(self.mlp_dim, dtype=self.dtype_mm, name="head2", **self.inits)(x)
+    return x
 
 class MlpBlock(nn.Module):
   """Transformer MLP / feed-forward block."""
   mlp_dim: Optional[int] = None  # Defaults to 4x input dim
   dropout: float = 0.0
   dtype_mm: str = "float32"
+  precision: Optional[jax.lax.Precision] = None
 
   @nn.compact
   def __call__(self, x, deterministic=True):
@@ -68,15 +147,289 @@ class MlpBlock(nn.Module):
         bias_init=nn.initializers.normal(stddev=1e-6),
     )
 
-    d = x.shape[-1]
-    x = nn.Dense(self.mlp_dim or 4 * d, dtype=self.dtype_mm, **inits)(x)
-    # In some extreme batch-size cases, this is needed as of Sept 2024:
-    x = nn.with_logical_constraint(x, ("act_batch", "act_len", "act_emb"))
+    n, l, d = x.shape  # pylint: disable=unused-variable
+    x1 = x = nn.Dense(self.mlp_dim or 4 * d, dtype=self.dtype_mm, **inits, precision=self.precision)(x)
+    x = nn.with_logical_constraint(x, ("flattened_images", "act_patches", "act_emb"))
     x = nn.gelu(x)
     x = nn.Dropout(rate=self.dropout)(x, deterministic)
-    x = nn.Dense(d, dtype=self.dtype_mm, **inits)(x)
+    x = nn.Dense(d, dtype=self.dtype_mm, **inits, precision=self.precision)(x)
     return x
 
+class DenseWithDeterministic(nn.Dense):
+  @nn.compact
+  def __call__(self, x, deterministic=True):
+    return super().__call__(x)
+
+class MultiHeadDotProductAttentionCombinedProj(nn.MultiHeadDotProductAttention):
+  mesh: Optional[jax.sharding.Mesh] = None
+  
+  @compact
+  def __call__(
+    self,
+    inputs_q,
+    inputs_k = None,
+    inputs_v = None,
+    *,
+    inputs_kv = None,
+    mask = None,
+    deterministic = None,
+    dropout_rng = None,
+    sow_weights = False,
+  ):
+    if inputs_kv is not None:
+      if inputs_k is not None or inputs_v is not None:
+        raise ValueError(
+          'If either `inputs_k` or `inputs_v` is not None, '
+          '`inputs_kv` must be None. If `inputs_kv` is not None, both `inputs_k` '
+          'and `inputs_v` must be None. We recommend using `inputs_k` and '
+          '`inputs_v` args, since `inputs_kv` will be deprecated soon. See '
+          'https://github.com/google/flax/discussions/3389 for more '
+          'information.'
+        )
+      inputs_k = inputs_v = inputs_kv
+      warnings.warn(
+        'The inputs_kv arg will be deprecated soon. '
+        'Use inputs_k and inputs_v instead. See '
+        'https://github.com/google/flax/discussions/3389 '
+        'for more information.',
+        DeprecationWarning,
+      )
+    else:
+      if inputs_k is None:
+        if inputs_v is not None:
+          raise ValueError(
+            '`inputs_k` cannot be None if `inputs_v` is not None. '
+            'To have both `inputs_k` and `inputs_v` be the same value, pass in the '
+            'value to `inputs_k` and leave `inputs_v` as None.'
+          )
+        inputs_k = inputs_q
+      if inputs_v is None:
+        inputs_v = inputs_k
+      elif inputs_v.shape[-1] == inputs_v.shape[-2]:
+        warnings.warn(
+          f'You are passing an array of shape {inputs_v.shape} '
+          'to the `inputs_v` arg, when you may have intended '
+          'to pass it to the `mask` arg. As of Flax version '
+          '0.7.4, the function signature of '
+          "MultiHeadDotProductAttention's `__call__` method "
+          'has changed to `__call__(inputs_q, inputs_k=None, '
+          'inputs_v=None, *, inputs_kv=None, mask=None, '
+          'deterministic=None)`. Use the kwarg `mask` instead. '
+          'See https://github.com/google/flax/discussions/3389 '
+          'and read the docstring for more information.',
+          DeprecationWarning,
+        )
+
+    features = self.out_features or inputs_q.shape[-1]
+    qkv_features = self.qkv_features or inputs_q.shape[-1]
+    assert qkv_features % self.num_heads == 0, (
+      f'Memory dimension ({qkv_features}) must be divisible by number of'
+      f' heads ({self.num_heads}).'
+    )
+    head_dim = qkv_features // self.num_heads
+
+
+    dense = functools.partial(
+      nn.Dense,
+      dtype=self.dtype,
+      param_dtype=self.param_dtype,
+      features=qkv_features, # (self.num_heads, head_dim),
+      kernel_init=self.kernel_init,
+      bias_init=self.bias_init,
+      use_bias=self.use_bias,
+      precision=self.precision,
+      dot_general=self.qkv_dot_general,
+      dot_general_cls=self.qkv_dot_general_cls,
+    )
+    # project inputs_q to multi-headed q/k/v
+    # dimensions are then [batch..., length, n_heads, n_features_per_head]
+    query_layer = dense(name='query')
+    query, key, value = (
+      query_layer(inputs_q).reshape(*inputs_q.shape[:-1], self.num_heads, head_dim),
+      dense(name='key')(inputs_k).reshape(*inputs_k.shape[:-1], self.num_heads, head_dim),
+      dense(name='value')(inputs_v).reshape(*inputs_v.shape[:-1], self.num_heads, head_dim),
+    )
+    query = nn.with_logical_constraint(query, ("flattened_images", "act_patches", "act_emb", "act_emb2"))
+    key = nn.with_logical_constraint(key, ("flattened_images", "act_patches", "act_emb", "act_emb2"))
+    value = nn.with_logical_constraint(value, ("flattened_images", "act_patches", "act_emb", "act_emb2"))
+
+    if self.normalize_qk:
+      # Normalizing query and key projections stabilizes training with higher
+      # LR. See ViT-22B paper http://arxiv.org/abs/2302.05442 for analysis.
+      query = nn.LayerNorm(
+        name='query_ln',
+        use_bias=False,
+        dtype=self.dtype,
+        param_dtype=self.param_dtype,
+      )(query)  # type: ignore[call-arg]
+      key = nn.LayerNorm(
+        name='key_ln',
+        use_bias=False,
+        dtype=self.dtype,
+        param_dtype=self.param_dtype,
+      )(key)  # type: ignore[call-arg]
+
+    # During fast autoregressive decoding, we feed one position at a time,
+    # and cache the keys and values step by step.
+    if self.decode:
+      # detect if we're initializing by absence of existing cache data.
+      is_initialized = self.has_variable('cache', 'cached_key')
+      cached_key = self.variable(
+        'cache', 'cached_key', jnp.zeros, key.shape, key.dtype
+      )
+      cached_value = self.variable(
+        'cache', 'cached_value', jnp.zeros, value.shape, value.dtype
+      )
+      cache_index = self.variable(
+        'cache', 'cache_index', lambda: jnp.array(0, dtype=jnp.int32)
+      )
+      if is_initialized:
+        (
+          *batch_dims,
+          max_length,
+          num_heads,
+          depth_per_head,
+        ) = cached_key.value.shape
+        # shape check of cached keys against query input
+        expected_shape = tuple(batch_dims) + (1, num_heads, depth_per_head)
+        if expected_shape != query.shape:
+          raise ValueError(
+            'Autoregressive cache shape error, '
+            'expected query shape %s instead got %s.'
+            % (expected_shape, query.shape)
+          )
+        # update key, value caches with our new 1d spatial slices
+        cur_index = cache_index.value
+        zero = jnp.array(0, dtype=lax.dtype(cur_index.dtype))
+        indices: tuple[int | jax.Array, ...] = (zero,) * len(
+          batch_dims
+        ) + (
+          cur_index,
+          zero,
+          zero,
+        )
+        key = lax.dynamic_update_slice(cached_key.value, key, indices)
+        value = lax.dynamic_update_slice(cached_value.value, value, indices)
+        cached_key.value = key
+        cached_value.value = value
+        cache_index.value = cache_index.value + 1
+        # causal mask for cached decoder self-attention:
+        # our single query position should only attend to those key
+        # positions that have already been generated and cached,
+        # not the remaining zero elements.
+        mask = combine_masks(
+          mask,
+          jnp.broadcast_to(
+            jnp.arange(max_length) <= cur_index,
+            tuple(batch_dims) + (1, 1, max_length),
+          ),
+        )
+
+    if (
+      self.dropout_rate > 0.0
+    ):  # Require `deterministic` only if using dropout.
+      m_deterministic = merge_param(
+        'deterministic', self.deterministic, deterministic
+      )
+      if not m_deterministic and dropout_rng is None:
+        dropout_rng = self.make_rng('dropout')
+    else:
+      m_deterministic = True
+
+    # `qk_attn_weights_einsum` and `attn_weights_value_einsum` are optional
+    # arguments that can be used to override the default `jnp.einsum`. They
+    # exist for quantized einsum support in AQT.
+    qk_attn_weights_einsum = (
+        self.qk_attn_weights_einsum_cls()
+        if self.qk_attn_weights_einsum_cls
+        else None
+    )
+    attn_weights_value_einsum = (
+        self.attn_weights_value_einsum_cls()
+        if self.attn_weights_value_einsum_cls
+        else None
+    )
+    # apply attention
+    attn_args = (query, key, value)
+    # This kwargs list match the default nn.dot_product_attention.
+    # For custom `attention_fn`s, invalid kwargs will be filtered.
+    attn_kwargs = dict(
+      mask=mask,
+      dropout_rng=dropout_rng,
+      dropout_rate=self.dropout_rate,
+      broadcast_dropout=self.broadcast_dropout,
+      deterministic=m_deterministic,
+      dtype=self.dtype,
+      precision=self.precision,
+      force_fp32_for_softmax=self.force_fp32_for_softmax,
+      qk_attn_weights_einsum=qk_attn_weights_einsum,
+      attn_weights_value_einsum=attn_weights_value_einsum,
+    )
+    attn_kwargs = {
+        k: v
+        for k, v in attn_kwargs.items()
+        if k in inspect.signature(self.attention_fn).parameters
+    }
+    block_size = 128
+    attention_bias = jnp.concatenate((
+      jnp.zeros((query.shape[0], 1, query.shape[1], query.shape[1]), dtype=query.dtype),
+      -10000.*jnp.ones((query.shape[0], 1, query.shape[1], block_size-(query.shape[1] % block_size)), dtype=query.dtype)
+    ), axis=-1)
+    attention_bias = jnp.concatenate((
+      attention_bias,
+      -10000.*jnp.ones((query.shape[0], 1, block_size-(query.shape[1] % block_size), attention_bias.shape[-1]), dtype=query.dtype)
+    ), axis=-2)
+    attention_bias = nn.with_logical_constraint(attention_bias, ('flattened_images', 'act_emb1', 'act_patches', 'act_patches2'))
+    query = jnp.transpose(query, (0, 2, 1, 3))
+    key = jnp.transpose(key, (0, 2, 1, 3))
+    value = jnp.transpose(value, (0, 2, 1, 3))
+    query_padded = jnp.concatenate((
+      query,
+      jnp.zeros((query.shape[0], query.shape[1], block_size-(query.shape[2] % block_size), query.shape[3]), dtype=query.dtype),
+    ), axis=2)
+    key_padded = jnp.concatenate((
+      key,
+      jnp.zeros((key.shape[0], key.shape[1], block_size-(key.shape[2] % block_size), key.shape[3]), dtype=key.dtype),
+    ), axis=2)
+    value_padded = jnp.concatenate((
+      value,
+      jnp.zeros((value.shape[0], value.shape[1], block_size-(value.shape[2] % block_size), value.shape[3]), dtype=value.dtype),
+    ), axis=2)
+    flash_attn_1head = shard_map(
+        functools.partial(flash_attention, sm_scale=1.0/math.sqrt(query.shape[-1])),
+        mesh=self.mesh,
+        in_specs=(
+          jax.sharding.PartitionSpec(('fsdp', 'sequence'), 'tensor', None, None),
+          jax.sharding.PartitionSpec(('fsdp', 'sequence'), 'tensor', None, None),
+          jax.sharding.PartitionSpec(('fsdp', 'sequence'), 'tensor', None, None),
+          jax.sharding.PartitionSpec(('fsdp', 'sequence'), None, None, None),
+        ),
+        out_specs=jax.sharding.PartitionSpec(('fsdp', 'sequence'), 'tensor', None, None),
+        check_rep=False,
+    )
+    x = flash_attn_1head(
+      query_padded,
+      key_padded,
+      value_padded,
+      attention_bias
+    )
+    x = jnp.transpose(x, (0, 2, 1, 3))[:,:query.shape[2],:,:]
+    # back to the original inputs dimensions
+    x = x.reshape(*x.shape[:-2], -1)
+    x = nn.with_logical_constraint(x, ("flattened_images", "act_patches", "act_emb"))
+    out = nn.Dense(
+      features=features,
+      kernel_init=self.out_kernel_init or self.kernel_init,
+      bias_init=self.out_bias_init or self.bias_init,
+      use_bias=self.use_bias,
+      dtype=self.dtype,
+      param_dtype=self.param_dtype,
+      precision=self.precision,
+      dot_general=self.out_dot_general,
+      dot_general_cls=self.out_dot_general_cls,
+      name='out',  # type: ignore[call-arg]
+    )(x)
+    return out
 
 class Encoder1DBlock(nn.Module):
   """Single transformer encoder block (MHSA + MLP)."""
@@ -84,31 +437,56 @@ class Encoder1DBlock(nn.Module):
   num_heads: int = 12
   dropout: float = 0.0
   dtype_mm: str = "float32"
+  built_in_attn_class: bool = True
+  precision: Optional[jax.lax.Precision] = None
+  mesh: Optional[jax.sharding.Mesh] = None
+  mlp_chunk_size: int = None
+  remat_policy: str = None
 
   @nn.compact
   def __call__(self, x, deterministic=True):
     out = {}
-    x = nn.with_logical_constraint(x, ("act_batch", "act_len", "act_emb"))
+
+    x = nn.with_logical_constraint(x, ("flattened_images", "act_patches", "act_emb"))
     y = nn.LayerNorm()(x)
-    y = out["sa"] = nn.MultiHeadDotProductAttention(
+    out["+ln"] = y
+    attn_class = nn.MultiHeadDotProductAttention if self.built_in_attn_class else MultiHeadDotProductAttentionCombinedProj
+    y = out["sa"] = attn_class(
         num_heads=self.num_heads,
         kernel_init=nn.initializers.xavier_uniform(),
         deterministic=deterministic,
         dtype=self.dtype_mm,
+        name="MultiHeadDotProductAttention_0",
+        precision=self.precision,
+        **({'mesh': self.mesh} if not self.built_in_attn_class else {}),
     )(y, y)
-    y = nn.with_logical_constraint(y, ("act_batch", "act_len", "act_emb"))
+    y = nn.with_logical_constraint(y, ("flattened_images", "act_patches", "act_emb"))
     y = nn.Dropout(rate=self.dropout)(y, deterministic)
     x = out["+sa"] = x + y
 
     y = nn.LayerNorm()(x)
-    y = out["mlp"] = MlpBlock(
-        mlp_dim=self.mlp_dim, dropout=self.dropout,
-        dtype_mm=self.dtype_mm,
-    )(y, deterministic)
-    y = nn.with_logical_constraint(y, ("act_batch", "act_len", "act_emb"))
+    mlp_block = None
+    if self.remat_policy is None:
+      mlp_block = MlpBlock(
+          mlp_dim=self.mlp_dim, dropout=self.dropout,
+          dtype_mm=self.dtype_mm,
+          precision=self.precision,
+      )
+    else:
+      mlp_block = nn.remat(
+          MlpBlock,
+          prevent_cse=True,
+          static_argnums=(2,),
+          policy=getattr(jax.checkpoint_policies, self.remat_policy, None),
+      )(mlp_dim=self.mlp_dim, dropout=self.dropout, dtype_mm="bfloat16", precision=self.precision, name="MlpBlock_0")
+    if self.mlp_chunk_size is None:
+      y = out["mlp"] = mlp_block(y, deterministic)
+    else:
+      y = out["mlp"] = block_wise_ffn(mlp_block, y, self.mlp_chunk_size, deterministic, axis=1)
+    y = nn.with_logical_constraint(y, ("flattened_images", "act_patches", "act_emb"))
     y = nn.Dropout(rate=self.dropout)(y, deterministic)
     x = out["+mlp"] = x + y
-    x = nn.with_logical_constraint(x, ("act_batch", "act_len", "act_emb"))
+    x = nn.with_logical_constraint(x, ("flattened_images", "act_patches", "act_emb"))
     return x, out
 
 
@@ -121,10 +499,16 @@ class Encoder(nn.Module):
   scan: bool = False
   remat_policy: str = "nothing_saveable"
   dtype_mm: str = "float32"
+  built_in_attn_class: bool = True
+  precision: Optional[jax.lax.Precision] = None
+  mesh: Optional[jax.sharding.Mesh] = None
+  mlp_chunk_size: int = None
+  post_layer_norm: bool = True
 
   @nn.compact
   def __call__(self, x, deterministic=True):
     out = {}
+    sharding_info(x, "vit encoder input")
 
     if self.scan:
       block = nn.remat(
@@ -132,7 +516,7 @@ class Encoder(nn.Module):
           prevent_cse=False,
           static_argnums=(2,),  # 0=self, 2=deterministic
           policy=getattr(jax.checkpoint_policies, self.remat_policy, None),
-          )
+      )
       x, scan_out = nn.scan(
           block,
           variable_axes={"params": 0},
@@ -143,21 +527,39 @@ class Encoder(nn.Module):
               dtype_mm=self.dtype_mm,
               mlp_dim=self.mlp_dim,
               num_heads=self.num_heads,
-              dropout=self.dropout)(x, deterministic)
+              dropout=self.dropout,
+              built_in_attn_class=self.built_in_attn_class,
+              precision=self.precision,
+              mesh=self.mesh,
+              mlp_chunk_size=self.mlp_chunk_size,
+              remat_policy=self.remat_policy)(x, deterministic)
       for lyr in range(self.depth):
         out[f"block{lyr:02d}"] = jax.tree.map(lambda o, l=lyr: o[l], scan_out)
     else:
+      block = nn.remat(
+        Encoder1DBlock,
+        prevent_cse=True,
+        static_argnums=(2,),
+        policy=getattr(jax.checkpoint_policies, self.remat_policy, None),
+      )
       # Input Encoder
       for lyr in range(self.depth):
-        block_cur = Encoder1DBlock(
+        block_cur = block( # Encoder1DBlock(
             name=f"encoderblock_{lyr}",
             dtype_mm=self.dtype_mm,
             mlp_dim=self.mlp_dim, num_heads=self.num_heads,
-            dropout=self.dropout)
-        x, out[f"block{lyr:02d}"] = block_cur(x, deterministic)
-      out["pre_ln"] = x  # Alias for last block, but without the number in it.
+            dropout=self.dropout,
+            built_in_attn_class=self.built_in_attn_class,
+            precision=self.precision,
+            mesh=self.mesh,
+            mlp_chunk_size=self.mlp_chunk_size,
+            remat_policy=None) # self.remat_policy)
+        x, block_out = block_cur(x, deterministic)
+        if lyr == self.depth-1:
+          out[f"block{lyr:02d}"] = block_out
 
-    return nn.LayerNorm(name="encoder_norm")(x), out
+    final_encoder_out = nn.LayerNorm(name="encoder_norm")(x) if self.post_layer_norm else x
+    return final_encoder_out, out
 
 
 class MAPHead(nn.Module):
@@ -196,14 +598,21 @@ class _Model(nn.Module):
   rep_size: Union[int, bool] = False
   dropout: float = 0.0
   pool_type: str = "gap"  # Can also be "map" or "tok"
-  head_zeroinit: bool = True
+  pool_mlp2xgelu: bool = False
+  head_zeroinit: bool = False # True
+  add_image_newline: bool = False
   scan: bool = False
   # or "dots_with_no_batch_dims_saveable" for more speed (memory costly)
   remat_policy: str = "nothing_saveable"
   dtype_mm: str = "float32"
+  built_in_attn_class: bool = True
+  precision: str = "default"
+  img_token_pooling: dict = None
+  mesh: Optional[jax.sharding.Mesh] = None
+  mlp_chunk_size: int = None
 
   @nn.compact
-  def __call__(self, image, *, train=False):
+  def __call__(self, image, *, train=False, **kwargs):
     out = {}
 
     image = jnp.asarray(image, self.dtype_mm)
@@ -211,7 +620,8 @@ class _Model(nn.Module):
     # Patch extraction
     x = out["stem"] = nn.Conv(
         self.width, self.patch_size, strides=self.patch_size,
-        padding="VALID", name="embedding", dtype=self.dtype_mm)(image)
+        padding="VALID", name="embedding", dtype=self.dtype_mm, precision=utils.PRECISION_MAP[self.precision])(image)
+    x = nn.with_logical_constraint(x, ("flattened_images", "act_patches", "act_emb"))
 
     n, h, w, c = x.shape
     x = jnp.reshape(x, [n, h * w, c])
@@ -235,6 +645,10 @@ class _Model(nn.Module):
         scan=self.scan,
         remat_policy=self.remat_policy,
         dtype_mm=self.dtype_mm,
+        built_in_attn_class=self.built_in_attn_class,
+        precision=utils.PRECISION_MAP[self.precision] if self.precision is not None else None,
+        mesh=self.mesh,
+        mlp_chunk_size=self.mlp_chunk_size,
         name="Transformer")(
             x, deterministic=not train)
     encoded = out["encoded"] = x
@@ -264,21 +678,69 @@ class _Model(nn.Module):
       x_2d = nn.tanh(hid(x_2d))
       x = nn.tanh(hid(x))
 
+    
+    x = nn.with_logical_constraint(x, ("flattened_images", "act_patches", "act_emb"))
+    x_2d = nn.with_logical_constraint(x_2d, ("flattened_images", "act_patches_height", "act_patches_width", "act_emb"))
     out["pre_logits_2d"] = x_2d
     out["pre_logits"] = x
+    sharding_info(x, "pre_logits")
 
     if self.num_classes:
       kw = {"kernel_init": nn.initializers.zeros} if self.head_zeroinit else {}
-      head = nn.Dense(self.num_classes, name="head", **kw)
-      x_2d = out["logits_2d"] = head(x_2d)
-      x = out["logits"] = head(x)
+      kw['precision'] = utils.PRECISION_MAP[self.precision]
+      if self.pool_mlp2xgelu:
+        dense_block = nn.remat(
+            DenseWithDeterministic,
+            # LlavaMlp,
+            # prevent_cse=False,
+            static_argnums=(1,),  # 0=self
+            policy=getattr(jax.checkpoint_policies, self.remat_policy, None),
+        )
+        print('self.remat_policy', self.remat_policy)
+
+        head_layer1 = dense_block(self.num_classes, name="head1", **kw)
+        head_layer2 = dense_block(self.num_classes, name="head2", **kw)
+        max_layer_num = max([int(key.split('block')[1]) for key in out['encoder'] if 'block' in key])
+        x = encoded = out['encoder']['block'+str(max_layer_num)]['+mlp']
+        """x_2d = nn.with_logical_constraint(
+          head_layer1(x_2d) if self.mlp_chunk_size is None else block_wise_ffn(head_layer1, x_2d, self.mlp_chunk_size, not train),
+          ("flattened_images", "act_patches_height", "act_patches_width", "act_emb")
+        )"""
+        if True: # self.mlp_chunk_size is None:
+          x = nn.with_logical_constraint(head_layer1(x), ("flattened_images", "act_patches", "act_emb"))
+          x = head_layer2(nn.gelu(x, approximate=False))
+        else:
+          x = nn.with_logical_constraint(
+            block_wise_ffn(head_layer1, x, self.mlp_chunk_size, not train),
+            ("flattened_images", "act_patches", "act_emb"),
+          )
+          x = block_wise_ffn(head_layer2, nn.gelu(x, approximate=False), self.mlp_chunk_size, not train)
+        x_2d = out["logits_2d"] = nn.with_logical_constraint(
+          jnp.reshape(x, [n, h, w, -1]),
+          ("flattened_images", "act_patches_height", "act_patches_width", "act_emb"),
+        )
+      else:
+        head = nn.Dense(self.num_classes, name="head", **kw)
+        x_2d = out["logits_2d"] = head(x_2d)
+    if self.add_image_newline:
+      image_newline = nn.Embed(
+          1,
+          self.num_classes,
+          dtype=self.dtype_mm,
+          param_dtype=self.dtype_mm,
+          name="image_newline"
+      )
+      newline_emb = image_newline(jnp.zeros((x.shape[0],), dtype=jnp.int32))
+      out["image_newline"] = newline_emb[:,None,:]
 
     return x, out
 
 
 def Model(num_classes=None, *, variant=None, **kw):  # pylint: disable=invalid-name
   """Factory function, because linen really don't like what I'm doing!"""
-  return _Model(num_classes, **{**decode_variant(variant), **kw})
+  cfg = {**decode_variant(variant)}
+  cfg.update({**kw})
+  return _Model(num_classes, **cfg)
 
 
 def decode_variant(variant):
@@ -420,8 +882,13 @@ def load(init_params, init_file, model_cfg, dont_load=()):  # pylint: disable=in
       and "encoderblock" in restored_params["Transformer"]):
     restored_params = scan_to_pyloop(restored_params)
 
+  print("image model config", model_cfg)
+  if (not model_cfg.add_image_newline) and "image_newline" in restored_params:
+    del restored_params["image_newline"]
+  
   # possibly use the random init for some of the params (such as, the head).
   restored_params = common.merge_params(restored_params, init_params, dont_load)
+
 
   # resample posemb if needed.
   # TODO: Take this from model_cfg to avoid need for init_params.
@@ -476,27 +943,5 @@ VANITY_NAMES = {
     "SigLIP So400m/14 224": "gs://big_vision/siglip/webli_en_so400m_224_57633886.npz:img",
     "SigLIP So400m/14 384": "gs://big_vision/siglip/webli_en_so400m_384_58765454.npz:img",
     "SigLIP B/16-i18n 256": "gs://big_vision/siglip/webli_i18n_b16_256_66117334.npz:img",
-
-    # SigLIP 2 image encoder checkpoints from https://arxiv.org/abs/2502.14786
-    "SigLIP2 B/16 224": "gs://big_vision/siglip2/siglip2_b16_224.npz:img",
-    "SigLIP2 B/16 256": "gs://big_vision/siglip2/siglip2_b16_256.npz:img",
-    "SigLIP2 B/16 384": "gs://big_vision/siglip2/siglip2_b16_384.npz:img",
-    "SigLIP2 B/16 512": "gs://big_vision/siglip2/siglip2_b16_512.npz:img",
-    "SigLIP2 B/32 256": "gs://big_vision/siglip2/siglip2_b32_256.npz:img",
-    "SigLIP2 L/16 256": "gs://big_vision/siglip2/siglip2_l16_256.npz:img",
-    "SigLIP2 L/16 384": "gs://big_vision/siglip2/siglip2_l16_384.npz:img",
-    "SigLIP2 L/16 512": "gs://big_vision/siglip2/siglip2_l16_512.npz:img",
-    "SigLIP2 So400m/14 224": "gs://big_vision/siglip2/siglip2_so400m14_224.npz:img",
-    "SigLIP2 So400m/14 384": "gs://big_vision/siglip2/siglip2_so400m14_384.npz:img",
-    "SigLIP2 So400m/16 256": "gs://big_vision/siglip2/siglip2_so400m16_256.npz:img",
-    "SigLIP2 So400m/16 384": "gs://big_vision/siglip2/siglip2_so400m16_384.npz:img",
-    "SigLIP2 So400m/16 512": "gs://big_vision/siglip2/siglip2_so400m16_512.npz:img",
-    "SigLIP2 g-opt/16 256": "gs://big_vision/siglip2/siglip2_g-opt16_256.npz:img",
-    "SigLIP2 g-opt/16 384": "gs://big_vision/siglip2/siglip2_g-opt16_384.npz:img",
-    # SigLIP 2 NaFlex image encoder checkpoints.
-    # These need `proj.image_text.naflex_vit.py` as the image encoder model
-    # and a non-standard preprocessing, see configs/proj/image_text/README_siglip2.md.
-    "SigLIP2 B/16 NaFlex": "gs://big_vision/siglip2/siglip2_b16_naflex.npz:img",
-    "SigLIP2 So400m/16 NaFlex": "gs://big_vision/siglip2/siglip2_so400m16_naflex.npz:img",
     # pylint: enable=line-too-long
 }

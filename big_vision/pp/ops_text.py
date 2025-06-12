@@ -22,7 +22,6 @@ A commonly used key for the tokenized output is "labels".
 """
 import functools
 import importlib
-import string
 
 from absl import logging
 from big_vision.datasets.imagenet import class_names as imagenet_class_names
@@ -33,6 +32,7 @@ from big_vision.pp.registry import Registry
 import tensorflow as tf
 
 from tensorflow.io import gfile
+from transformers import AutoTokenizer, Qwen2Tokenizer
 
 import sentencepiece
 SPProcessor = sentencepiece.SentencePieceProcessor
@@ -225,17 +225,6 @@ def get_pp_clip_i1k_label_names():
   return _pp_imagenet_labels
 
 
-@Registry.register("preprocess_ops.i21k_label_names")
-@utils.InKeyOutKey(indefault="label", outdefault="labels")
-def get_pp_i21k_label_names():
-  """Converts i21k label ids to strings."""
-
-  def _pp_imagenet_labels(label):
-    return tf.gather(imagenet_class_names.IMAGENET21k_CLASS_NAMES, label)
-
-  return _pp_imagenet_labels
-
-
 @Registry.register("preprocess_ops.lower")
 @utils.InKeyOutKey(indefault="text", outdefault="text")
 def get_lower():
@@ -245,30 +234,6 @@ def get_lower():
     return tf.strings.lower(text)
 
   return _pp_lower
-
-
-@Registry.register("preprocess_ops.strfmt")
-def get_strfmt(template, outkey="text"):
-  """Formats a string template with content form the data dict."""
-
-  def _template(data):
-    outputs = []
-    parts = string.Formatter().parse(template)
-    for (literal_text, field_name, format_spec, conversion) in parts:
-      # For now, we keep it simple and don't support fancy format specs.
-      # But we can add support to that via py_func as soon as we need it.
-      assert not format_spec and not conversion
-      outputs.append(tf.constant(literal_text))
-      if field_name:
-        value = data[field_name]
-        # Convert any non-strings (numbers, vectors) to a string.
-        if tf.convert_to_tensor(value).dtype != tf.string:
-          value = tf.strings.format("{}", value, summarize=-1)
-        outputs.append(value)
-    data[outkey] = tf.strings.join(outputs)
-    return data
-
-  return _template
 
 
 def _add_pieces(model_bytes, extra_pieces):
@@ -391,12 +356,125 @@ class SentencepieceTokenizer(bv_tok.Tokenizer):
     text = tf.convert_to_tensor(text)
     if text.ndim == 0:
       def fn(txt):
-        s = txt.numpy().decode()
-        return tf.constant(self.to_int(s, bos=bos, eos=eos), tf.int32)
+        string = txt.numpy().decode()
+        return tf.constant(self.to_int(string, bos=bos, eos=eos), tf.int32)
       return tf.py_function(fn, [text], tf.int32)
     else:
       def fn(txt):
         strings = [s.decode() for s in txt.numpy().tolist()]
+        toks = self.to_int(strings, bos=bos, eos=eos)
+        return tf.ragged.constant(toks)
+      out_type = tf.RaggedTensorSpec([tf.shape(text)[0], None], tf.int32)
+      return tf.py_function(fn, [text], Tout=out_type)
+
+  def to_str_tf_op(self, tokens, *, stop_at_eos=True):
+    def single(t):
+      fn = functools.partial(self.to_str, stop_at_eos=stop_at_eos)
+      return tf.numpy_function(fn, [t], tf.string, stateful=False)
+    if _iterable(tokens):
+      return tf.map_fn(single, tokens, tf.string)
+    return single(tokens)
+
+@Registry.register("tokenizers.hf")
+class HuggingfaceTokenizer(bv_tok.Tokenizer):
+  """Wraps a Huggingface tokenizer.
+
+  If you plan to use this tokenizer, please familiarize yourself with the test
+  cases first. This is likely to save you a lot of troubles down the road, trust
+  me!
+  """
+
+  def __init__(self, model, tokensets=(), num_unused_tokens=0, num_extra_tokens=0):
+    cls = AutoTokenizer
+    self.tokenizer = cls.from_pretrained(model)
+    # DEFAULT_IM_START_TOKEN = "<im_start>"
+    # DEFAULT_IM_END_TOKEN = "<im_end>"
+    # self.tokenizer.add_tokens([DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN], special_tokens=True)
+    self.tokenizer.add_tokens(['<image>'], special_tokens=False)
+    if num_unused_tokens > 0:
+      self.tokenizer.add_tokens([f'<unused{i}>' for i in range(num_unused_tokens)])
+    if num_extra_tokens > 0:
+      # self.tokenizer.add_tokens([f'<{i+1}>' for i in range(num_extra_tokens)], special_tokens=True)
+      self.tokenizer.add_tokens([f'<{i}>' for i in range(num_extra_tokens)], special_tokens=True)
+
+  def to_int(self, text, *, bos=False, eos=False):
+    def _single(s):
+      return (
+          ([self.bos_token] if bos else []) +
+          # [0 for _ in range(10)] +
+          # self._tok_sp.EncodeAsIds(s) +
+          [self.tokenizer.convert_tokens_to_ids(t) for t in self.tokenizer.tokenize(s)] +
+          ([self.eos_token] if eos else [])
+      )
+    if isinstance(text, str):
+      return _single(text)
+    return type(text)([_single(s) for s in text])
+
+  def to_str(self, tokens, *, stop_at_eos=True):
+    def _single(toks):
+      toks = [int(t) for t in toks]  # We really need this for DecodeIds.
+      if stop_at_eos:
+        try:  # The SentencePiece strips eos, but does not stop at it, so we do.
+          toks = toks[:toks.index(self.eos_token)]
+        except ValueError:  # No eos token found, nothing to do.
+          pass
+      print(toks)
+      return self.tokenizer.convert_tokens_to_string([
+        self.tokenizer._convert_id_to_token(t)
+        for t in toks
+      ])
+    if _iterable(tokens):
+      return [_single(toks) for toks in tokens]
+    return _single(tokens)
+
+  def _check_known(self, piece):
+    if piece not in self.tokenizer.vocab:
+      logging.error("Piece '%s' is not known (unk=%s)!", piece, id_)
+    id_ = self.tokenizer._convert_token_to_id(piece)
+    if isinstance(id_, list):
+      id_ = id_[0]
+    return id_
+
+  def to_piece(self, idx):
+    return self.tokenizer._convert_id_to_token(int(idx))
+    # return self.tokenizer.convert_ids_to_tokens(int(idx))
+
+  @property
+  def pad_token(self):
+    # return self._tok_sp.pad_id()
+    return self.tokenizer.pad_token_id
+
+  @property
+  def eos_token(self):
+    # return self._tok_sp.eos_id()
+    return self.tokenizer.eos_token_id
+
+  @property
+  def bos_token(self):
+    # return self._tok_sp.bos_id()
+    # return self.tokenizer.bos_token_id
+    return 151644
+
+  @property
+  def vocab_size(self):
+    return self.tokenizer.vocab_size
+
+  # For the _tf_op variants, we need a lot of wrapping boilerplate.
+
+  def to_int_tf_op(self, text, *, bos=False, eos=False):
+    text = tf.convert_to_tensor(text)
+    if text.ndim == 0:
+      def fn(txt):
+        # tf.print('inside fn', txt)
+        string = txt.numpy().decode()
+        # tf.print('to_int_tf_op if', string)
+        return tf.constant(self.to_int(string, bos=bos, eos=eos), tf.int32)
+      # tf.print('tf.py_function', text)
+      return tf.py_function(fn, [text], tf.int32)
+    else:
+      def fn(txt):
+        strings = [s.decode() for s in txt.numpy().tolist()]
+        # tf.print('to_int_tf_op else', strings[0])
         toks = self.to_int(strings, bos=bos, eos=eos)
         return tf.ragged.constant(toks)
       out_type = tf.RaggedTensorSpec([tf.shape(text)[0], None], tf.int32)

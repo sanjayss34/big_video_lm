@@ -26,7 +26,9 @@ import os
 import re
 import sys
 import time
+import math
 from typing import Mapping
+from functools import lru_cache
 
 from absl import flags
 from absl import logging
@@ -35,7 +37,6 @@ import einops
 import flax
 import flax.jax_utils as flax_utils
 import jax
-from jax.experimental import mesh_utils
 from jax.experimental.array_serialization import serialization as array_serial
 import jax.numpy as jnp
 import ml_collections as mlc
@@ -46,6 +47,11 @@ import tensorflow.io.gfile as gfile  # pylint: disable=consider-using-from-impor
 
 Registry = pp_registry.Registry
 
+PRECISION_MAP = {
+  'default': jax.lax.Precision.DEFAULT,
+  'high': jax.lax.Precision.HIGH,
+  'highest': jax.lax.Precision.HIGHEST
+}
 
 # pylint: disable=logging-fstring-interpolation
 
@@ -216,9 +222,7 @@ def load_params(ckpt, **kw):
       # Here we're now loading new-style tensorstore checkpoints.
       # We can be a more efficient and load params and `key` only right away.
       regex = f"params/{key}($|/.*)" if key else "params/.*"
-      assert "regex" not in kw, "For a custom regex, use tsload directly."
-      kw["regex"] = regex
-      checkpoint = load_checkpoint_ts(ckpt, **kw)
+      checkpoint = load_checkpoint_ts(ckpt, regex=regex)
       params = checkpoint["params"]
 
   if key is not None:
@@ -528,8 +532,6 @@ class Chrono:
     self.note += f"\nTotal train time:{hms(dt / steps_timed*self.total_steps)}"
     write_note(self.note)
 
-    log_memory(measure)
-
     self.prev_time = now
     self.paused_time = 0
 
@@ -589,28 +591,6 @@ class Chrono:
 
 # Singleton to use from everywhere. https://stackoverflow.com/a/6760726/2366315
 chrono = Chrono()
-
-
-def log_memory(measure):
-  """Log a bunch of memory-related measurements."""
-  try:
-    import psutil
-  except ImportError:
-    psutil = None
-
-  if psutil is not None:
-    # Note that total != available + used, see psutil docs.
-    vmem = psutil.virtual_memory()
-    measure("y/hostmem/total", vmem.total)
-    measure("y/hostmem/available", vmem.available)
-    measure("y/hostmem/used", vmem.used)
-
-  # We show only device 0 and 1 to avoid spam. The reason to show two and not
-  # just one, if multiple are available, is because a frequent mistake is to
-  # create arrays on the default device, which is device 0.
-  for i, d in zip([0, 1], jax.local_devices()):
-    for k, v in (d.memory_stats() or {}).items():
-      measure(f"y/devmem/dev{i}/{k}", v)
 
 
 def _traverse_with_names(tree, with_inner_nodes=False):
@@ -944,6 +924,59 @@ def load_checkpoint_ts(path, **tsload_kw):
 
   return tsload(to_load, **tsload_kw)
 
+def float_tensor_to_dtype(tensor, dtype):
+    if dtype is None or dtype == '':
+        return tensor
+    if isinstance(dtype, str):
+        dtype = get_float_dtype_by_name(dtype)
+    float_dtypes = (jnp.bfloat16, jnp.float16, jnp.float32, jnp.float64)
+    if getattr(tensor, 'dtype', None) in float_dtypes:
+        tensor = tensor.astype(dtype)
+    return tensor
+
+def scalax_load_checkpoint(pytree, target=None, shard_fns=None, remove_dict_prefix=None, convert_to_dtypes=None):
+    if shard_fns is not None:
+        shard_fns = flax.traverse_util.flatten_dict(
+            flax.serialization.to_state_dict(shard_fns)
+        )
+    if convert_to_dtypes is not None:
+        convert_to_dtypes = flax.traverse_util.flatten_dict(
+            flax.serialization.to_state_dict(convert_to_dtypes)
+        )
+    if remove_dict_prefix is not None:
+        remove_dict_prefix = tuple(remove_dict_prefix)
+    flat_pytree = flax.traverse_util.flatten_dict(pytree)
+    flattend_train_state = {}
+    for key, value in flat_pytree.items():
+        key = tuple(key)
+        # print(key)
+        # print(list(shard_fns.keys())[:10])
+        if remove_dict_prefix is not None:
+            if key[:len(remove_dict_prefix)] == remove_dict_prefix:
+                key = key[len(remove_dict_prefix):]
+            else:
+                continue
+
+        tensor = jnp.asarray(value)
+        if convert_to_dtypes is not None:
+            tensor = float_tensor_to_dtype(tensor, convert_to_dtypes[key])
+        if shard_fns is not None:
+            tensor = shard_fns[key](tensor)
+        flattend_train_state[key] = tensor
+
+    if target is not None:
+        flattened_target = flax.traverse_util.flatten_dict(
+            flax.serialization.to_state_dict(target), keep_empty_nodes=True
+        )
+        for key, value in flattened_target.items():
+            if key not in flattend_train_state and value == empty_node:
+                flattend_train_state[key] = value
+
+    train_state = flax.traverse_util.unflatten_dict(flattend_train_state)
+    if target is None:
+        return train_state
+
+    return flax.serialization.from_state_dict(target, train_state)
 
 def tsload(path, *, tree=None, shardings=None, regex=None):
   """Loads tensorstore-based array-tree from disk.
@@ -995,7 +1028,7 @@ def tsload(path, *, tree=None, shardings=None, regex=None):
   names_to_load = [os.path.join(path, name.replace("/", "~"))
                    for name in names_to_load]
   specs = [array_serial.get_tensorstore_spec(n) for n in names_to_load]
-  arrays = array_serial.run_deserialization(shardings, specs, concurrent_gb=64)
+  arrays = array_serial.run_deserialization(shardings, specs)
   return tree_def.unflatten(arrays)
 
 
@@ -1029,15 +1062,12 @@ def steps(prefix, config, data_size=None, batch_size=None, total_steps=None,
   """
   # Be helpful and make sure only match one of the following suffixes.
   suffixes = {"steps", "examples", "epochs", "percent"}
-  matches = {
-      f"{prefix}_{s}"
-      for s in suffixes
-      if (x := config.get(f"{prefix}_{s}")) is not None and x >= 0
-  }
+  matches = {f"{prefix}_{s}" for s in suffixes if f"{prefix}_{s}" in config
+             and config[f"{prefix}_{s}"] is not None}
   # Note that steps=0 is also a valid value (e.g. to only run evaluators).
   assert len(matches) <= 1, f"Only one of '{matches}' should be defined."
 
-  if f"{prefix}_steps" in matches:
+  if f"{prefix}_steps" in config:
     return config[f"{prefix}_steps"]
 
   def to_integer(x):
@@ -1045,14 +1075,14 @@ def steps(prefix, config, data_size=None, batch_size=None, total_steps=None,
     # asked for 0. E.g. total_epochs=0 vs total_epochs=0.0001
     return max(1, round(x)) if x else 0
 
-  if batch_size and f"{prefix}_examples" in matches:
+  if batch_size and f"{prefix}_examples" in config:
     return to_integer(config[f"{prefix}_examples"] / batch_size)
 
-  if batch_size and data_size and f"{prefix}_epochs" in matches:
+  if batch_size and data_size and f"{prefix}_epochs" in config:
     steps_per_epoch = data_size / batch_size
     return to_integer(config[f"{prefix}_epochs"] * steps_per_epoch)
 
-  if total_steps and f"{prefix}_percent" in matches:
+  if total_steps and f"{prefix}_percent" in config:
     pct = config[f"{prefix}_percent"]
     assert 0.0 <= pct <= 1.0, (  # Be helpful, since it's not obvious.
         f"Percents should lie in [0.0, 1.0], but {prefix}_percent is {pct}")
@@ -1088,11 +1118,10 @@ def create_learning_rate_schedule(
     A function learning_rate(step): float -> {"learning_rate": float}.
   """
 
-  def to_steps(name, default=0):
-    return steps(name, kw, data_size, batch_size, total_steps, default=default)
-
-  warmup_steps = to_steps("warmup")
-  cooldown_steps = to_steps("cooldown")
+  warmup_steps = steps(
+      "warmup", kw, data_size, batch_size, total_steps, default=0)
+  cooldown_steps = steps(
+      "cooldown", kw, data_size, batch_size, total_steps, default=0)
 
   # Early catch hard to backtrack errors due to warmup_steps >= total_steps,
   # but let it run for 0 and 1 steps used to eval and debug runs.
@@ -1101,6 +1130,9 @@ def create_learning_rate_schedule(
 
   def step_fn(step):
     """Step to learning rate function."""
+    # Because step = 0 leads to lr = 0, which leads to all-zero updates and nan params
+    # step = step_minus_one+1
+
     lr = base
 
     # This implements the linear scaling rule following
@@ -1121,8 +1153,11 @@ def create_learning_rate_schedule(
     elif decay_type == "rsqrt":
       # See (internal link) for details, especially how to set timescale
       # and shift in order to continue smoothly when changing batch-size.
-      t = to_steps("timescale", default=kw.get("timescale", 10_000))
-      shift = to_steps("shift", default=kw.get("shift", 0))
+      if "timescale_examples" in kw:
+        t = kw["timescale_examples"] / batch_size
+      else:
+        t = kw.get("timescale", 10_000)  # bwd-compat default.
+      shift = kw.get("shift", 0)
       lr = jnp.where(
           warmup_steps <= step,
           lr / jnp.sqrt(1 + (step + shift - warmup_steps) / t),  # In decay
@@ -1137,6 +1172,7 @@ def create_learning_rate_schedule(
       lr = lr * jnp.minimum(1., step / warmup_steps)
     if cooldown_steps:
       lr = lr * jnp.minimum(1., (total_steps - step) / cooldown_steps)
+    # jax.debug.print("step {s} lr {lr}", s=step, lr=lr)
 
     return jnp.asarray(lr, dtype=jnp.float32)
 
@@ -1222,7 +1258,7 @@ def profile(name, ttl=3 * 365 * 24 * 3600, noop=False):
 
 
 def startstop_prof(sess, step=None, first_step=0,
-                   log_steps=1, surround=10, **kw):
+                   log_steps=1, surround=20, **kw):
   """Runs the profiler for `surround` steps around the next `log_steps`."""
   first_log = first_step + log_steps - (first_step % log_steps)
   # don't start before first!
@@ -1345,6 +1381,13 @@ def tree_broadcast(prefix, target):
   return jax.tree.map(_broadcast, prefix, target)
 
 
+@lru_cache(maxsize=64)
+def _get_mapping(shard, shape):
+    # Cache the sorted mapping for a given shard and shape.
+    # Note: we convert the mapping items to a tuple so it can be cached.
+    mapping = shard.addressable_devices_indices_map(shape)
+    return tuple(sorted(mapping.items(), key=lambda kv: kv[0].id))
+
 def reshard(tree, shardings):
   """Take an arbitrarily* sharded pytree and shard it according to `shardings`.
 
@@ -1370,10 +1413,20 @@ def reshard(tree, shardings):
     if not getattr(x, "is_fully_addressable", True):
       raise RuntimeError("Trying to reshard a non-fully-addressable array. "
                          "Please see the doc-comment for detailed explanation.")
-    x = jax.device_get(x)  # Might be on local devices.
-    xs = [jax.device_put(x[s], device=d)
-          for d, s in shard.addressable_devices_indices_map(shape).items()]
-    return jax.make_array_from_single_device_arrays(shape, shard, xs)
+    # Avoid device_get if x is already a NumPy array (i.e. on host)
+    if not isinstance(x, np.ndarray):
+      x = jax.device_get(x)
+
+    # Retrieve the mapping (cached for speed)
+    mapping = _get_mapping(shard, shape)
+    devices, slices = zip(*mapping)  # sorted by device id
+    # Slice the host array for each device.
+    shards = [x[s] for s in slices]
+    # Transfer all shards in one call.
+    sharded = jax.device_put_sharded(shards, devices)
+    # xs = [jax.device_put(x[s], device=d)
+    #       for d, s in shard.addressable_devices_indices_map(shape).items()]
+    return jax.make_array_from_single_device_arrays(shape, shard, [sharded[i] for i in range(len(sharded))])
 
   shapes = jax.tree.map(np.shape, tree)
   shardings = tree_broadcast(shardings, tree)
@@ -1385,7 +1438,7 @@ def put_cpu(x):
   return jax.device_put(x, jax.local_devices(backend="cpu")[0])
 
 
-def make_fsarray_from_local_slice(local_slice, global_devices):
+def make_fsarray_from_local_slice(local_slice, global_devices, axis_name="devices", sharding=None):
   """Create a fully-sharded global device array from local host arrays.
 
   Args:
@@ -1397,17 +1450,66 @@ def make_fsarray_from_local_slice(local_slice, global_devices):
     The global on-device array which consists of all local slices stacked
     together in the order consistent with the devices.
   """
-  mesh = jax.sharding.Mesh(global_devices, ("devices",))
-  sharding = jax.sharding.NamedSharding(
-      mesh, jax.sharding.PartitionSpec("devices"))
-  local_ds = mesh.local_devices
+  if sharding is not None:
+    axis_name = "fsdp"
+    mesh = sharding.mesh
+    local_ds = mesh.local_devices
+    x = np.asarray(memoryview(local_slice))  # No-copy: http://(internal link)
+    # Calculate the number of shards along each axis based on the product of the sizes of the mesh axes
+    """num_shards = []
+    global_local_index = None
+    num_hosts = len(global_devices) // len(local_ds)
+    local_axis_size = mesh.shape[axis_name] // num_hosts
+    nonunit_mesh_axes = [axis_name for axis_name in mesh.shape if mesh.shape[axis_name] > 1]
+    for s_index, spec in enumerate(sharding.spec):
+      if spec is None:
+        num_shards.append(1)
+      elif isinstance(spec, tuple):
+        shard_count = 1
+        for axis in spec:
+          shard_count *= mesh.shape[axis] if axis != axis_name else local_axis_size
+          if axis in nonunit_mesh_axes:
+            nonunit_mesh_axes.remove(axis)
+        num_shards.append(shard_count)
+        if axis_name in spec:
+          global_local_index = s_index
+      else:
+        num_shards.append(mesh.shape[spec] if spec != axis_name else local_axis_size)
+        if spec in nonunit_mesh_axes:
+          nonunit_mesh_axes.remove(spec)
+        if axis_name == spec:
+          global_local_index = s_index
+    factor = 1
+    if len(nonunit_mesh_axes) > 0:
+      factor = math.prod([mesh.shape[axis_name] for axis_name in nonunit_mesh_axes])
+      for s_index, spec in enumerate(sharding.spec):
+        if spec is not None and (axis_name == spec or axis_name in spec):
+          shape = (*x.shape[:s_index], x.shape[s_index]*factor, *x.shape[s_index+1:])
+          x = np.repeat(np.expand_dims(x, axis=s_index+1), repeats=factor, axis=s_index+1).reshape(*shape)
+          num_shards[s_index] *= factor
+    global_shape = tuple(x.shape)
+    if global_local_index is not None:
+      global_shape = (*x.shape[:global_local_index], x.shape[global_local_index]*jax.process_count(), *x.shape[global_local_index+1:])
 
-  x = np.asarray(memoryview(local_slice))  # No-copy: http://(internal link)
-  xs = jax.device_put(np.split(x, len(local_ds), axis=0), local_ds)
+    # Split the array according to the sharding specification
+    print(num_shards)
+    slices = [np.split(x, n, axis=i) for i, n in enumerate(num_shards) if n > 1]
+    flattened_slices = [item for sublist in slices for item in sublist]
+    
+    # Ensure the local slices are assigned to the correct devices
+    xs = jax.device_put(flattened_slices, [dev for dev in local_ds])"""
+    xs = jax.device_put(np.split(x, len(local_ds), axis=0), local_ds)
+    global_shape = (x.shape[0] * jax.process_count(), *x.shape[1:])
+  else:
+    mesh = jax.sharding.Mesh(global_devices, (axis_name,))
+    sharding = jax.sharding.NamedSharding(
+        mesh, jax.sharding.PartitionSpec(axis_name))
+    local_ds = mesh.local_devices
+    x = np.asarray(memoryview(local_slice))  # No-copy: http://(internal link)
+    xs = jax.device_put(np.split(x, len(local_ds), axis=0), local_ds)
+    global_shape = (x.shape[0] * jax.process_count(), *x.shape[1:])
 
-  global_shape = (x.shape[0] * jax.process_count(), *x.shape[1:])
   return jax.make_array_from_single_device_arrays(global_shape, sharding, xs)
-
 
 def get_local_slice_from_fsarray(global_array):
   """Return numpy array for the host-local slice of fully-sharded array.
@@ -1453,26 +1555,3 @@ def jit_cpu(**extra_kwargs):
       return jax.jit(fun, **extra_kwargs, out_shardings=sh)(*args, **kwargs)
     return _wrapped
   return _decorator
-
-
-def create_device_mesh(
-    config_mesh,
-    *,
-    allow_split_physical_axes=False,
-):
-  """Returns a JAX device mesh.
-
-  Args:
-    config_mesh: A list of tuples of (axis_name, axis_size). It is advised to
-      sort the axis in increasing order of network communication intensity.
-    allow_split_physical_axes: Whether to allow splitting physical axes.
-  """
-  devices = jax.devices()
-  mesh_axes, mesh_size = tuple(zip(*config_mesh))
-  # Because jax.utils do not support `-1` shape size.
-  mesh_size = np.array(devices).reshape(mesh_size).shape
-  device_mesh = mesh_utils.create_device_mesh(
-      mesh_size,
-      devices=devices,
-      allow_split_physical_axes=allow_split_physical_axes)
-  return jax.sharding.Mesh(device_mesh, mesh_axes)

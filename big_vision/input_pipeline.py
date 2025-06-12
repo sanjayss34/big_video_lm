@@ -18,6 +18,7 @@ import functools
 import itertools
 import math
 import multiprocessing.pool
+from functools import lru_cache
 
 from absl import logging
 from big_vision.datasets import sequence_packing
@@ -39,7 +40,7 @@ def make_for_train(
     num_parallel_calls=DEFAULT_NUM_PARALLEL_CALLS, prefetch=2,
     *,
     pre_filter_fn=None, post_filter_fn=None,
-    pack=None, skip_errors=False,
+    pack=None, skip_errors=False, divide_by_process_count=True
 ):
   """Makes an input pipeline for training."""
   # Use data filtering at your own risk: the actual split sizes won't be known
@@ -63,21 +64,24 @@ def make_for_train(
 
   data = data.ignore_errors(log_warning=True) if skip_errors else data
 
-  if pack:
-    data = sequence_packing.pack_dataset(
-        data,
-        batch_size // jax.process_count() if batch_size else None,
-        pack.to_dict())
+  data = sequence_packing.pack_dataset(data, pack) if pack else data
+
+  # if divide_by_process_count:
+  #   data = data.enumerate().filter(lambda i, x: tf.equal(i % jax.process_count(), jax.process_index())).map(lambda j, y: y)
 
   # Drop remainder makes shape fully static, so we can later use it if needed.
   if batch_size:
-    data = data.batch(batch_size // jax.process_count(), drop_remainder=True)
+    data = data.batch(
+      (batch_size // jax.process_count() if divide_by_process_count else batch_size),
+      drop_remainder=True
+    )
+  # print('training data len', len(data))
   if prefetch:  # None means autotune, but we never want that.
     data = data.prefetch(prefetch)
   return data
 
 
-def training(input_config):
+def training(input_config, divide_by_process_count=True):
   """Reads the data from a single dataset, or mixes it from multiple.
 
   The data is read either from one or mixed from multiple datasets, depending
@@ -103,11 +107,11 @@ def training(input_config):
   if isinstance(input_config.data.get("name"), str):
     train_data = ds_core.get(**input_config.data)
     train_ds = make_for_train(
-        data=train_data.get_tfdata(ordered=False,
-                                   **input_config.get("tfdata", {})),
+        data=train_data.get_tfdata(ordered=input_config.get("ordered", False), process_split=divide_by_process_count, split_by_modulus=True),
         batch_size=batch_size,
         preprocess_fn=pp_builder.get_preprocess_fn(input_config.get("pp")),
         prefetch=input_config.get("prefetch", 2),  # Default 2 for bwd compat.
+        divide_by_process_count=divide_by_process_count,
         **config_to_kw(input_config)
     )
     return train_ds, train_data.total_examples
@@ -123,8 +127,9 @@ def training(input_config):
     name, weight = name_and_weight
     dataset = input_config[name]
     train_data = ds_core.get(**dataset.data)
+    # print('train data total examples', train_data.total_examples)
     dataset = make_for_train(
-        data=train_data.get_tfdata(ordered=False, **dataset.get("tfdata", {})),
+        data=train_data.get_tfdata(ordered=input_config.get("ordered", False), process_split=divide_by_process_count, split_by_modulus=True),
         # Don't batch the data just yet, it will be done after
         # mixing the different datasets below.
         batch_size=None,
@@ -137,9 +142,7 @@ def training(input_config):
     return name, dataset, weight, train_data.total_examples
 
   names, datasets, weights, totals = [], [], [], []
-  pool = multiprocessing.pool.ThreadPool(
-      input_config.get("thread_pool_size", len(input_config.data))
-  )
+  pool = multiprocessing.pool.ThreadPool(len(input_config.data))
   for name, dataset, weight, total in pool.map(
       # Skip weight=0 datasets as a convenient optimization in sweeps.
       _make, ((name, w) for name, w in input_config.data.items() if w)):
@@ -153,20 +156,18 @@ def training(input_config):
 
   logging.info(
       "NOTE: Total dataset mix size: %d\nContributions:\n%s", sum(totals),
-      "\n".join(f"{ds}: {n} ({w * 100:.2g}%)"
+      "\n".join(f"{ds}: {n} ({w * 100:.1g}%)"
                 for ds, n, w in zip(names, totals, weights))
   )
 
   train_ds = tf.data.Dataset.sample_from_datasets(
       datasets, weights, stop_on_empty_dataset=True)
   if input_config.get("pack"):
-    train_ds = sequence_packing.pack_dataset(
-        train_ds,
-        input_config["batch_size"] // jax.process_count(),
-        input_config.pack.to_dict())
-
+    train_ds = sequence_packing.pack_dataset(train_ds, input_config.get("pack"))
   train_ds = train_ds.batch(
-      input_config["batch_size"] // jax.process_count(), drop_remainder=True)
+      (input_config["batch_size"] // jax.process_count() if divide_by_process_count else input_config["batch_size"]),
+      drop_remainder=True
+  )
   if (pf := input_config.get("prefetch", 2)):
     train_ds = train_ds.prefetch(pf)
 
@@ -182,6 +183,7 @@ def make_for_inference(
     data, preprocess_fn, batch_size, num_ex_per_process,
     cache_raw=False, cache_final=False,
     num_parallel_calls=DEFAULT_NUM_PARALLEL_CALLS, prefetch=1,
+    divide_by_process_count=True
 ):
   """Makes an input pipeline for inference."""
 
@@ -191,7 +193,7 @@ def make_for_inference(
                   num_parallel_calls=num_parallel_calls)
   data = data.concatenate(_get_pad_data(data))
 
-  local_batch_size = batch_size // jax.process_count()
+  local_batch_size = (batch_size // jax.process_count() if divide_by_process_count else batch_size)
   # This is just like `batch`, but allows batching elements of different shapes
   # into a tf.RaggedTensor. Elements of the same fixed shape remain tf.Tensors.
   # Since we do 'infinite' padding it is safe to drop the remainder.
@@ -200,13 +202,14 @@ def make_for_inference(
   # We need to make sure that all hosts process all data and exactly the same
   # number of batches. Below we take max per-host num examples and use it on all
   # hosts to derive the number of batches.
-  num_batches = math.ceil(max(num_ex_per_process) / local_batch_size)
+  num_batches = math.ceil(max(num_ex_per_process) * (1 if divide_by_process_count else jax.process_count()) / local_batch_size)
   data = data.take(num_batches)
 
   # Note we cache data after a finite number of batches is taken.
   data = data.cache() if cache_final else data
   data = data.repeat()
   data = data.prefetch(prefetch) if prefetch else data
+  print('num_batches', batch_size, local_batch_size, jax.process_count(), num_batches, num_ex_per_process)
   return data, num_batches
 
 
@@ -310,16 +313,71 @@ def tf_to_numpy(x):
           for i in range(len(splits) - 1)]
   return np.fromiter(rows, dtype=object)
 
+@lru_cache(maxsize=64)
+def _get_mapping(shard, shape):
+    # Cache the sorted mapping for a given shard and shape.
+    # Note: we convert the mapping items to a tuple so it can be cached.
+    mapping = shard.addressable_devices_indices_map(shape)
+    return tuple(sorted(mapping.items(), key=lambda kv: kv[0].id))
 
 # Note that the order of global devices for sharding data is important and
 # should be compatible with device order used for models params, state, etc.
 def start_global(
-    data, global_devices, n_prefetch=1, keep_on_cpu=frozenset(), warmup=False):
+    data, global_devices, n_prefetch=1, keep_on_cpu=frozenset(), warmup=False, keep_all_on_cpu=False, device_axis_name="devices", sharding_map=None, full_batch_size=1):
   """Starts the global input pipeline."""
   def maybe_shard(name, x):
-    if name in keep_on_cpu:
+    if keep_all_on_cpu or name in keep_on_cpu:
       return tf_to_numpy(x)
-    return u.make_fsarray_from_local_slice(x, global_devices)
+    elif sharding_map is not None:
+      # print(name, x.shape, sharding_map[name])
+      # print('hello, world')
+      # print(x, np.asarray(x))
+      # print('hello, world world')
+      spec = sharding_map[name].spec
+      if name == "_mask":
+        spec = jax.sharding.PartitionSpec(("replica", "fsdp"))
+      x = tf_to_numpy(x)
+      """mesh = sharding_map[name].mesh
+      shape = x.shape
+      shape = (full_batch_size,)+tuple(shape[1:])
+      shard = sharding_map[name]
+      # Retrieve the mapping (cached for speed)
+      mapping = _get_mapping(shard, shape)
+      # mapping = shard.addressable_devices_indices_map(shape)
+      # print(name, shard)
+      # print(list(mapping.items()))
+      # print(mapping)
+      devices, slices = zip(*mapping)  # sorted by device id
+      # print(name, shard, slices)
+      slices = [(slice(0, full_batch_size // jax.process_count(), None),)+s[1:] for s in slices] #  if d in jax.local_devices()]
+      # print(name, slices)
+      # devices = [d for d in devices if d in jax.local_devices()]
+      original_pspec = shard.spec  # e.g. ("batch", "feature")
+      local_pspec = jax.sharding.PartitionSpec(*( (None,) + tuple(original_pspec)[1:]))
+      local_shard = jax.sharding.NamedSharding(shard.mesh, local_pspec)
+      # Slice the host array for each device.
+      shards = [x[s] for s in slices]
+      # Transfer all shards in one call.
+      sharded = jax.device_put_sharded(shards, devices)
+      with jax.transfer_guard("allow"):
+        gathered = jax.experimental.multihost_utils.process_allgather(sharded)
+      # xs = [jax.device_put(x[s], device=d)
+      #       for d, s in shard.addressable_devices_indices_map(shape).items()]
+      # a = jax.make_array_from_single_device_arrays(x.shape, local_shard, [sharded[i] for i in range(len(sharded))])
+      a = jax.make_array_from_single_device_arrays(shape, shard, [gathered[i] for i in range(len(gathered))])"""
+      # a = sharded.reshape(*x.shape)
+      try:
+        # print('sharding', name)
+        # print(x.shape, spec)
+        pass
+      except:
+        pass
+      with jax.transfer_guard("allow"):
+        a = jax.experimental.multihost_utils.host_local_array_to_global_array(x, sharding_map[name].mesh, spec)
+      # print('done', name, a.shape)
+      return a
+    # print(name, x.shape, sharding_map[name])
+    return u.make_fsarray_from_local_slice(x, global_devices, axis_name=device_axis_name, sharding=sharding_map[name] if sharding_map is not None else None)
 
   it = iter(data)
   if warmup:  # actually pre-fill shuffle buffers etc.

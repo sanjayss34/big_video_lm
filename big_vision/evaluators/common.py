@@ -36,10 +36,11 @@ from tensorflow.io import gfile
 def from_config(config, predict_fns,
                 write_note=lambda s: s,
                 get_steps=lambda key, cfg: cfg[f"{key}_steps"],
-                devices=None):
+                devices=None, sharding_config=None, sharding_rules=None):
   """Creates a list of evaluators based on `config`."""
   evaluators = []
   specs = config.get("evals", {})
+  extra_model_args = config.get("eval_extra_model_args", [])
 
   for name, cfg in specs.items():
     write_note(name)
@@ -64,6 +65,11 @@ def from_config(config, predict_fns,
     if devices is not None:
       cfg["devices"] = devices
 
+    if sharding_config is not None:
+      cfg["sharding_config"] = sharding_config
+    if sharding_rules is not None:
+      cfg["sharding_rules"] = sharding_rules
+
     api_type = getattr(module, "API", "pmap")
     if api_type == "pmap" and "devices" in cfg:
       raise RuntimeError(
@@ -82,7 +88,7 @@ def from_config(config, predict_fns,
           + "\n".join(predict_fns)) from e
     if pred_kw is not None:
       predict_fn = _CacheablePartial(predict_fn, flax.core.freeze(pred_kw))
-    evaluator = module.Evaluator(predict_fn, **cfg)
+    evaluator = module.Evaluator(predict_fn, extra_model_args=extra_model_args, **cfg)
     evaluators.append((name, evaluator, logsteps, prefix))
 
   return evaluators
@@ -114,7 +120,7 @@ class _CacheablePartial:
 
 def eval_input_pipeline(
     data, pp_fn, batch_size, devices, keep_on_cpu=(),
-    cache="pipeline", prefetch=1, warmup=False,
+    cache="pipeline", prefetch=1, warmup=False, keep_all_on_cpu=False, sharding_config=None,
 ):
   """Create an input pipeline in the way used by most evaluators.
 
@@ -147,14 +153,26 @@ def eval_input_pipeline(
   ), f"Unknown value for cache: {cache}"
   data_source = ds_core.get(**data)
   tfdata, steps = input_pipeline.make_for_inference(
-      data_source.get_tfdata(ordered=True, allow_cache=cache.lower() != "none"),
+      data_source.get_tfdata(ordered=True, allow_cache=cache.lower() != "none", process_split=not keep_all_on_cpu),
       batch_size=batch_size,
       num_ex_per_process=data_source.num_examples_per_process(),
       preprocess_fn=pp_builder.get_preprocess_fn(pp_fn, str(data)),
       cache_final=cache == "raw_data",
-      cache_raw=cache == "final_data")
+      cache_raw=cache == "final_data",
+      divide_by_process_count=not keep_all_on_cpu)
+  print('element spec', tfdata.element_spec)
+  dummy_batch = jax.tree.map(lambda x: np.zeros(x.shape, x.dtype.as_numpy_dtype),
+                       tfdata.element_spec)
+  sharding_map = None
+  if sharding_config is not None:
+    mesh = sharding_config.get_mesh().mesh
+    sharding_map = jax.tree.map(
+      lambda spec: jax.sharding.NamedSharding(mesh, spec),
+      sharding_config.get_batch_sharding().apply(dummy_batch)
+    )
   get_data_iter = lambda: input_pipeline.start_global(
-      tfdata, devices, prefetch, keep_on_cpu, warmup)
+      tfdata, devices, prefetch, keep_on_cpu, warmup, keep_all_on_cpu=keep_all_on_cpu, sharding_map=sharding_map)
+
 
   # Possibly create one persistent iterator:
   if cache in ("pipeline", "raw_data", "final_data"):
@@ -185,7 +203,7 @@ def resolve_outfile(outfile, split="", **kw):
 
   return outfile.format(
       workdir=flags.FLAGS.workdir,
-      split="".join(c if c not in "[]%:" else "_" for c in (split or "")),
+      split="".join(c if c not in "[]%:" else "_" for c in split),
       step=getattr(u.chrono, "prev_step", None),
       **kw,
   )

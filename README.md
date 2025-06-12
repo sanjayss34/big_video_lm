@@ -26,6 +26,7 @@ Finally, launch the job by running:
 ```
 bash vqa_inference_remote_launch.sh
 ```
+On the Perception Test validation set, you should get an accuracy of about 67%.
 
 ## Example 2: Ego4D moment retrieval
 In this example, we finetune LLaVA Video 7B on the Ego4D NLQ (natural language query) task for retrieving moments from an egocentric video.

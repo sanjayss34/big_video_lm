@@ -1,6 +1,7 @@
 # Video LM finetuning/inference in JAX
 
 The goal of this repo is to enable you to easily run inference and finetuning on video LMs in JAX.
+This repo borrows heavily from [big_vision](https://github.com/google-research/big_vision) and [easydel](https://github.com/erfanzar/EasyDeL/tree/main) - many thanks to those authors!
 
 ## Converting model weights from Huggingface PyTorch to Flax/JAX
 Here's an example command for converting model weights:
